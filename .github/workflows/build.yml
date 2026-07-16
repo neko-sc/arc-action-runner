@@ -1,0 +1,236 @@
+name: Build
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/arc-action-runner
+  UPSTREAM_REPO: actions/runner
+  UPSTREAM: https://github.com/actions/runner.git
+
+jobs:
+  rebase:
+    runs-on: arc-runner-set
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      skip: ${{ steps.check.outputs.skip }}
+      rebased: ${{ steps.rebase.outputs.rebased }}
+    steps:
+      - name: Get latest upstream release tag
+        id: upstream
+        run: |
+          TAG=$(curl -sf "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" | jq -r '.tag_name')
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: ${TAG}"
+
+      - name: Check if already built
+        id: check
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          EXISTING=$(curl -sf -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}" \
+            | jq -r '.tag_name' 2>/dev/null || echo "")
+          if [ "$EXISTING" = "$TAG" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists, skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rebase patches onto upstream tag
+        if: steps.check.outputs.skip != 'true'
+        id: rebase
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          git remote add upstream ${{ env.UPSTREAM }} || true
+          git fetch upstream --tags
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          CURRENT_BASE=$(git describe --tags --abbrev=0 --match='v*' HEAD)
+
+          if [ "$CURRENT_BASE" = "$TAG" ]; then
+            echo "Already on upstream ${TAG}, no rebase needed."
+            echo "rebased=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Rebasing patches from ${CURRENT_BASE} onto ${TAG}..."
+
+          if git rebase --onto "${TAG}" "${CURRENT_BASE}" main; then
+            echo "rebased=true" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort || true
+            echo "rebased=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create issue on rebase failure
+        if: steps.rebase.outputs.rebased == 'failed'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          EXISTING=$(curl -sf -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/${{ github.repository }}/issues?labels=rebase-conflict&state=open" \
+            | jq 'length')
+          if [ "$EXISTING" = "0" ]; then
+            curl -sf -X POST -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues" \
+              -d "{\"title\":\"Rebase conflict on upstream ${TAG}\",\"body\":\"Automatic rebase of patches onto upstream \`${TAG}\` failed. Manual resolution required.\",\"labels\":[\"rebase-conflict\"]}"
+          fi
+
+      - name: Push rebased main
+        if: steps.rebase.outputs.rebased == 'true'
+        run: git push --force origin HEAD:main
+
+  build-runner:
+    needs: rebase
+    if: needs.rebase.outputs.skip != 'true' && needs.rebase.outputs.rebased != 'failed'
+    runs-on: arc-runner-set
+    strategy:
+      matrix:
+        runtime: [linux-x64, linux-arm64]
+        include:
+          - runtime: linux-x64
+            arch: x64
+          - runtime: linux-arm64
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Set runner version
+        id: version
+        run: |
+          TAG="${{ needs.rebase.outputs.tag }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "${VERSION}" > src/runnerversion
+
+      - name: Build runner
+        working-directory: src
+        env:
+          ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT: ""
+        run: |
+          ./dev.sh layout Release ${{ matrix.runtime }}
+          ./dev.sh package Release ${{ matrix.runtime }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-${{ matrix.runtime }}
+          path: _package/actions-runner-${{ matrix.runtime }}-${{ steps.version.outputs.version }}.tar.gz
+
+  release:
+    needs: [rebase, build-runner]
+    runs-on: arc-runner-set
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.rebase.outputs.tag }}"
+          VERSION="${TAG#v}"
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "Runner ${VERSION}" \
+            --notes "Patched runner based on upstream ${TAG}" \
+            artifacts/runner-linux-x64/actions-runner-linux-x64-${VERSION}.tar.gz \
+            artifacts/runner-linux-arm64/actions-runner-linux-arm64-${VERSION}.tar.gz
+
+  build-image:
+    needs: [rebase, release]
+    runs-on: arc-runner-set
+    steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME_LC=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Resolve tool versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          github_latest() {
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1/releases/latest" \
+              | jq -r '.tag_name | sub("^v"; "")'
+          }
+
+          DOCKER_VERSION=$(
+            curl -fsSL https://download.docker.com/linux/static/stable/x86_64/ \
+              | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' \
+              | sort -V | tail -1
+          )
+
+          echo "docker=${DOCKER_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "buildx=$(github_latest docker/buildx)" >> "$GITHUB_OUTPUT"
+          echo "compose=$(github_latest docker/compose)" >> "$GITHUB_OUTPUT"
+          echo "container_hooks=$(github_latest actions/runner-container-hooks)" >> "$GITHUB_OUTPUT"
+          echo "gh_cli=$(github_latest cli/cli)" >> "$GITHUB_OUTPUT"
+          echo "yq=$(github_latest mikefarah/yq)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./images
+          file: ./images/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            RUNNER_VERSION=${{ needs.rebase.outputs.version }}
+            RUNNER_CONTAINER_HOOKS_VERSION=${{ steps.versions.outputs.container_hooks }}
+            DOCKER_VERSION=${{ steps.versions.outputs.docker }}
+            BUILDX_VERSION=${{ steps.versions.outputs.buildx }}
+            COMPOSE_VERSION=${{ steps.versions.outputs.compose }}
+            GH_CLI_VERSION=${{ steps.versions.outputs.gh_cli }}
+            YQ_VERSION=${{ steps.versions.outputs.yq }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:${{ needs.rebase.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
