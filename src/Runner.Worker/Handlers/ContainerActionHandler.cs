@@ -234,7 +234,12 @@ namespace GitHub.Runner.Worker.Handlers
                 Environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = generateIdTokenUrl;
                 Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
             }
-            if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+            string customActionsResultsUrl = System.Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL");
+            if (!string.IsNullOrEmpty(customActionsResultsUrl))
+            {
+                Environment["ACTIONS_RESULTS_URL"] = customActionsResultsUrl;
+            }
+            else if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
             {
                 Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
             }
