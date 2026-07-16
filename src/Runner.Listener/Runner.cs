@@ -606,7 +606,11 @@ namespace GitHub.Runner.Listener
                             HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
                             if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (autoUpdateInProgress == false)
+                                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL")))
+                                {
+                                    Trace.Info("Refresh message received, skip autoupdate since CUSTOM_ACTIONS_RESULTS_URL is set.");
+                                }
+                                else if (autoUpdateInProgress == false)
                                 {
                                     autoUpdateInProgress = true;
                                     AgentRefreshMessage runnerUpdateMessage = JsonUtility.FromString<AgentRefreshMessage>(message.Body);
@@ -643,7 +647,11 @@ namespace GitHub.Runner.Listener
                             }
                             else if (string.Equals(message.MessageType, RunnerRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (autoUpdateInProgress == false)
+                                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL")))
+                                {
+                                    Trace.Info("Refresh message received, skip autoupdate since CUSTOM_ACTIONS_RESULTS_URL is set.");
+                                }
+                                else if (autoUpdateInProgress == false)
                                 {
                                     autoUpdateInProgress = true;
                                     RunnerRefreshMessage brokerRunnerUpdateMessage = JsonUtility.FromString<RunnerRefreshMessage>(message.Body);
