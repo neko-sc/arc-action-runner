@@ -1,0 +1,222 @@
+name: Build
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if `version` already matches the latest upstream release
+        type: boolean
+        default: false
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/neko-sc/arc-action-runner
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      skip: ${{ steps.upstream.outputs.skip }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compare latest upstream release with version
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          TAG=$(gh api repos/actions/runner/releases/latest --jq .tag_name)
+          BUILT=$(cat version)
+          echo "Latest upstream: ${TAG}, last built: ${BUILT}, force: ${FORCE:-false}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          if [ "$TAG" = "$BUILT" ] && [ "$FORCE" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-runner:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runtime: [linux-x64, linux-arm64]
+    steps:
+      - name: Checkout overlay
+        uses: actions/checkout@v7
+        with:
+          path: overlay
+
+      - name: Checkout upstream
+        uses: actions/checkout@v7
+        with:
+          repository: actions/runner
+          ref: ${{ needs.check.outputs.tag }}
+          path: runner
+          fetch-depth: 0
+
+      - name: Apply patches
+        working-directory: runner
+        run: |
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            am -3 ../overlay/patches/*.patch
+
+      - name: Build runner
+        working-directory: runner/src
+        run: |
+          ./dev.sh layout Release ${{ matrix.runtime }}
+          ./dev.sh package Release ${{ matrix.runtime }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-${{ matrix.runtime }}
+          path: runner/_package/actions-runner-${{ matrix.runtime }}-${{ needs.check.outputs.version }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [check, build-runner]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ASSETS=(
+            "artifacts/runner-linux-x64/actions-runner-linux-x64-${VERSION}.tar.gz"
+            "artifacts/runner-linux-arm64/actions-runner-linux-arm64-${VERSION}.tar.gz"
+          )
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${ASSETS[@]}"
+          else
+            gh release create "$TAG" \
+              --title "Runner ${VERSION}" \
+              --notes "Patched runner based on upstream ${TAG}" \
+              "${ASSETS[@]}"
+          fi
+
+  build-image:
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tool versions
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          github_latest() {
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1/releases/latest" \
+              | jq -r '.tag_name | sub("^v"; "")'
+          }
+
+          DOCKER_VERSION=$(
+            curl -fsSL https://download.docker.com/linux/static/stable/x86_64/ \
+              | grep -oP 'docker-\K[0-9]+\.[0-9]+\.[0-9]+' \
+              | sort -V | tail -1
+          )
+
+          echo "docker=${DOCKER_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "buildx=$(github_latest docker/buildx)" >> "$GITHUB_OUTPUT"
+          echo "compose=$(github_latest docker/compose)" >> "$GITHUB_OUTPUT"
+          echo "container_hooks=$(github_latest actions/runner-container-hooks)" >> "$GITHUB_OUTPUT"
+          echo "gh_cli=$(github_latest cli/cli)" >> "$GITHUB_OUTPUT"
+          echo "yq=$(github_latest mikefarah/yq)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./images
+          file: ./images/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            RUNNER_VERSION=${{ needs.check.outputs.version }}
+            RUNNER_CONTAINER_HOOKS_VERSION=${{ steps.versions.outputs.container_hooks }}
+            DOCKER_VERSION=${{ steps.versions.outputs.docker }}
+            BUILDX_VERSION=${{ steps.versions.outputs.buildx }}
+            COMPOSE_VERSION=${{ steps.versions.outputs.compose }}
+            GH_CLI_VERSION=${{ steps.versions.outputs.gh_cli }}
+            YQ_VERSION=${{ steps.versions.outputs.yq }}
+          tags: ${{ env.IMAGE }}:${{ needs.check.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          REPORTED=$(docker run --rm --pull always --platform linux/amd64 \
+            -e ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT= \
+            "${IMAGE}:${TAG}" /home/runner/bin/Runner.Listener --version)
+          echo "Runner reports: ${REPORTED}"
+          [ "$REPORTED" = "$VERSION" ]
+
+      - name: Tag latest
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${TAG}"
+
+  record:
+    needs: [check, build-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Record built version
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          echo "$TAG" > version
+          if git diff --quiet; then
+            echo "version already ${TAG}"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -am "chore: record built version ${TAG}"
+          git push origin HEAD:main

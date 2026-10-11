@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Magic <magic@neko.sc>
+Date: Thu, 16 Jul 2026 05:30:46 -0700
+Subject: [PATCH] feat(cache): support CUSTOM_ACTIONS_RESULTS_URL override
+
+When CUSTOM_ACTIONS_RESULTS_URL environment variable is set, use it as
+ACTIONS_RESULTS_URL instead of the server-provided ResultsServiceUrl.
+This allows redirecting cache/artifact traffic to a self-hosted cache
+server.
+---
+ src/Runner.Worker/Handlers/ContainerActionHandler.cs  | 7 ++++++-
+ src/Runner.Worker/Handlers/NodeScriptActionHandler.cs | 7 ++++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/Runner.Worker/Handlers/ContainerActionHandler.cs b/src/Runner.Worker/Handlers/ContainerActionHandler.cs
+index 099495c..65f0dcc 100644
+--- a/src/Runner.Worker/Handlers/ContainerActionHandler.cs
++++ b/src/Runner.Worker/Handlers/ContainerActionHandler.cs
+@@ -234,7 +234,12 @@ namespace GitHub.Runner.Worker.Handlers
+                 Environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = generateIdTokenUrl;
+                 Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
+             }
+-            if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
++            string customActionsResultsUrl = System.Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL");
++            if (!string.IsNullOrEmpty(customActionsResultsUrl))
++            {
++                Environment["ACTIONS_RESULTS_URL"] = customActionsResultsUrl;
++            }
++            else if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+             {
+                 Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
+             }
+diff --git a/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs b/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
+index 85ff327..c7453db 100644
+--- a/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
++++ b/src/Runner.Worker/Handlers/NodeScriptActionHandler.cs
+@@ -68,7 +68,12 @@ namespace GitHub.Runner.Worker.Handlers
+                 Environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = generateIdTokenUrl;
+                 Environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = systemConnection.Authorization.Parameters[EndpointAuthorizationParameters.AccessToken];
+             }
+-            if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
++            string customActionsResultsUrl = System.Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL");
++            if (!string.IsNullOrEmpty(customActionsResultsUrl))
++            {
++                Environment["ACTIONS_RESULTS_URL"] = customActionsResultsUrl;
++            }
++            else if (systemConnection.Data.TryGetValue("ResultsServiceUrl", out var resultsUrl) && !string.IsNullOrEmpty(resultsUrl))
+             {
+                 Environment["ACTIONS_RESULTS_URL"] = resultsUrl;
+             }
+-- 
+2.47.3
+

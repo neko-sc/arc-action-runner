@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Magic <magic@neko.sc>
+Date: Thu, 16 Jul 2026 05:31:14 -0700
+Subject: [PATCH] feat(cache): disable auto-update when using custom results
+ URL
+
+Skip runner self-update when CUSTOM_ACTIONS_RESULTS_URL is set to
+prevent stock runner binary from overwriting the patched one.
+---
+ src/Runner.Listener/Runner.cs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/Runner.Listener/Runner.cs b/src/Runner.Listener/Runner.cs
+index 31c8713..931ac8d 100644
+--- a/src/Runner.Listener/Runner.cs
++++ b/src/Runner.Listener/Runner.cs
+@@ -607,7 +607,11 @@ namespace GitHub.Runner.Listener
+                             HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
+                             if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                             {
+-                                if (autoUpdateInProgress == false)
++                                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL")))
++                                {
++                                    Trace.Info("Refresh message received, skip autoupdate since CUSTOM_ACTIONS_RESULTS_URL is set.");
++                                }
++                                else if (autoUpdateInProgress == false)
+                                 {
+                                     autoUpdateInProgress = true;
+                                     AgentRefreshMessage runnerUpdateMessage = JsonUtility.FromString<AgentRefreshMessage>(message.Body);
+@@ -644,7 +648,11 @@ namespace GitHub.Runner.Listener
+                             }
+                             else if (string.Equals(message.MessageType, RunnerRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                             {
+-                                if (autoUpdateInProgress == false)
++                                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUSTOM_ACTIONS_RESULTS_URL")))
++                                {
++                                    Trace.Info("Refresh message received, skip autoupdate since CUSTOM_ACTIONS_RESULTS_URL is set.");
++                                }
++                                else if (autoUpdateInProgress == false)
+                                 {
+                                     autoUpdateInProgress = true;
+                                     RunnerRefreshMessage brokerRunnerUpdateMessage = JsonUtility.FromString<RunnerRefreshMessage>(message.Body);
+-- 
+2.47.3
+
